@@ -1,0 +1,23 @@
+name: CI-CD Pipeline
+
+on:
+  # Déclencheur manuel
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Raison du lancement manuel'
+        required: false
+        default: 'Déploiement manuel'
+      environment:
+        type: choice
+        description: 'Environnement cible'
+        options:
+          - rec1
+          - rec2
+          - ppr
+        default: rec1
+
+  # Déclencheur automatique sur création de tag
+  push:
+    tags:
+      - 'v*'
