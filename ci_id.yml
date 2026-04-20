@@ -1,0 +1,744 @@
+# Define global variables used throughout the pipeline.
+variables:
+  REPO_URL: https://gitlab.com/veolia.com/sarp/sarp/SARPDEVInt/ci-cd-repository/ci-dotnet-mvc
+  SONAR_PROJECT_NAME: "veolia-com-sarp-sarp-jason-jasoncodebase:10569998"
+  PROJECT_PATH: "./WebApplicationMVC"
+  PROJECT_SOURCES_PATH: "."
+  SONAR_ANALYSIS: false
+  IS_TEST: true
+  DO_BUILD: true
+  DEFAULT_PIPELINE_ID: 243
+
+# include:
+#   - local: /template_CI/build.yml
+#   - local: /template_CI/deploy.yml
+#   - local: /template_CI/publish.yml
+
+
+# Define the stages of the CI/CD pipeline.
+stages:
+  - build
+  - push-s3
+  - deploy-rec
+  - deploy-ec2-rec
+  - deploy-ppr
+  - deploy-ec2-ppr
+
+# Template job for building .NET applications.
+.build_template:
+  stage: build
+  image: registry.gitlab.com/veolia.com/sarp/sarp/sarpdevint/ci-cd-repository/sarp-sonarqube-dotnet:net-4.8
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .\packages
+      - .\Src\Jason.App\*\bin
+      - .\Src\Jason.App\*\obj
+    policy: pull-push
+  script:
+    - | 
+      if ($env:DO_BUILD -eq "false") {
+        Write-Host "No Build mode enabled, skipping build"
+        exit 0  # Exit with success status
+      }
+    # Create a directory for logs.
+    - '& New-Item -ItemType Directory -Force -Path "logs"'
+    # Add the custom NuGet source.
+    - '& nuget sources add -name jason -Source https://jason-nuget.sarpnet.fr/nuget/'
+    # Restore NuGet packages and log the output.
+    - '& nuget restore $env:SOLUTION > logs/nuget_restore.log 2>&1'
+    # Begin SonarQube analysis.
+    - |
+      if ($env:SONAR_ANALYSIS -eq "true") {
+        & SonarScanner.MSBuild.exe begin /k:$SONAR_PROJECT_NAME /d:sonar.host.url=http://10.79.152.7 /d:sonar.token=$SONAR_TOKEN /d:sonar.exclusions="**/bin/**/*,**/obj/**/*,**/packages/**/*,**/*.dll, **/*.sql, **/*.tsql, **/*.exe, **/*.js, **/*.css, **/*.json" /d:sonar.cs.file.suffixes=".cs" > logs/sonar_begin.log 2>&1
+      }
+    # Build and publish the web application.
+    - '& msbuild /m /p:DeployOnBuild=true /p:Configuration=Release /p:PublishProfile=FolderProfile $env:TARGET_WEB > logs/build_webapp.log 2>&1'
+    # Build and publish the job service.
+    - '& msbuild /m /t:Publish /p:Configuration=Release $env:TARGET_JOB > logs/build_service_job.log 2>&1'
+    # Build and publish the print service.
+    - '& msbuild /m /t:Publish /p:Configuration=Release $env:TARGET_PRINT  > logs/build_service_print.log 2>&1'
+    # Build and publish the main service.
+    - '& msbuild /m /t:Publish /p:Configuration=Release $env:TARGET_SERVICE > logs/build_service_service.log 2>&1'
+    # End SonarQube analysis.
+    - |
+      if ($env:SONAR_ANALYSIS -eq "true") {
+        & SonarScanner.MSBuild.exe end /d:sonar.login=$SONAR_TOKEN
+      }
+  variables:
+    SOLUTION: .\Src\Jason.App\Jason.sln
+    TARGET_WEB: .\Src\Jason.App\App\Jason.Web\Jason.Web.csproj
+    TARGET_JOB: .\Src\Jason.App\Jason.JobHost\Jason.JobHost.csproj
+    TARGET_PRINT: .\Src\Jason.App\Jason.PrintHost\Jason.PrintHost.csproj
+    TARGET_SERVICE: .\Src\Jason.App\Jason.Services.Host\Jason.Services.Host.csproj
+    PACKAGE_DIRECTORY: .\packages
+    DOTNET_FRAMEWORK: 4.5
+  artifacts:
+    when: always
+    paths:
+      - .\Src\Jason.App\App\Jason.Web\bin\app.publish
+      - .\Src\Jason.App\Jason.JobHost\bin\Release
+      - .\Src\Jason.App\Jason.PrintHost\bin\Release
+      - .\Src\Jason.App\Jason.Services.Host\bin\Release
+      - .\logs
+  tags:
+    - prd-win-2022
+  only:
+    - tags
+
+# Build job for all the environment.
+build:
+  extends: .build_template
+  variables:
+    SONAR_ANALYSIS: "false"
+
+# Template job for deploying to AWS S3.
+.push_s3_template:
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  stage: push-s3
+  before_script:
+    - yum install zip -y
+    - yum install unix2dos -y
+  script:
+    - |
+      if [ ! -z "$CI_COMMIT_TAG" ]; then
+        PIPELINE_ID=$CI_COMMIT_TAG
+      else
+        PIPELINE_ID=$CI_PIPELINE_IID
+      fi
+
+    - OBJECT_KEY_WEB="jason/$S3_ENV/$PIPELINE_ID/Web/Web.zip"
+    - OBJECT_KEY_JOB="jason/$S3_ENV/$PIPELINE_ID/Services/JobHost.zip"
+    - OBJECT_KEY_PRINT="jason/$S3_ENV/$PIPELINE_ID/Services/PrintHost.zip"
+    - OBJECT_KEY_SERVICE="jason/$S3_ENV/$PIPELINE_ID/Services/ServicesHost.zip"
+    - OBJECT_KEY_CONFIGS_SERVICE="jason/$S3_ENV/$PIPELINE_ID/Services/Configs.zip"
+    - OBJECT_KEY_CONFIGS_WEB="jason/$S3_ENV/$PIPELINE_ID/Web/Configs.zip"
+    - OBJECT_KEY_DB="jason/$S3_ENV/$PIPELINE_ID/Services/Db.zip"
+
+    - |
+      if [ "$DO_BUILD" = "false" ]; then
+      echo "Test mode enabled, skipping deployment"
+      exit 0  # Exit with success status
+      fi
+    # Deploy the web application.
+    - cd ./Src/Jason.App/App/Jason.Web/bin/app.publish
+    - zip -r jasonwebappbin.zip . && cd ./
+    - aws s3 cp jasonwebappbin.zip s3://$S3_BUCKET/$OBJECT_KEY_WEB
+    - cd ../../../../../../
+    # Deploy the JobHost application.
+    - cd ./Src/Jason.App/Jason.JobHost/bin/Release
+    - zip -r JobHost.zip . && cd ./
+    - aws s3 cp JobHost.zip s3://$S3_BUCKET/$OBJECT_KEY_JOB
+    - cd ../../../../../
+    # Deploy the PrintHost application.
+    - cd ./Src/Jason.App/Jason.PrintHost/bin/Release
+    - zip -r PrintHost.zip . && cd ./
+    - aws s3 cp PrintHost.zip s3://$S3_BUCKET/$OBJECT_KEY_PRINT
+    - cd ../../../../../
+    # Deploy the ServicesHost application.
+    - cd ./Src/Jason.App/Jason.Services.Host/bin/Release
+    - zip -r ServicesHost.zip . && cd ./
+    - aws s3 cp ServicesHost.zip s3://$S3_BUCKET/$OBJECT_KEY_SERVICE
+    - cd ../../../../../
+    # Deploy the confs Files.
+    - cd ./CICD/configs/$CONFIG_ENV
+    - |
+      for File in *; do 
+        sed -i.bak 's/__VERSION__/'$CI_COMMIT_REF_NAME'/g' "$File"
+        unix2dos "$File"
+        rm "$File.bak"
+      done
+    - zip -r Configs.zip . && cd ./
+    - aws s3 cp Configs.zip s3://$S3_BUCKET/$OBJECT_KEY_CONFIGS_SERVICE
+    - aws s3 cp Configs.zip s3://$S3_BUCKET/$OBJECT_KEY_CONFIGS_WEB
+    - cd ../../../
+    # Deploy the DBs Files.
+    - cd ./Db
+    - zip -r Db.zip proc_stock_rs "procedures stockees" upgrade views
+    - aws s3 cp Db.zip s3://$S3_BUCKET/$OBJECT_KEY_DB
+    - cd ../
+  dependencies:
+    - build #le faire dans le template
+  tags:
+    - prd
+  only:
+    - tags
+  
+# push binaries & config to S3 for the 'recette 1' environment.
+push_s3_rec1:
+  extends: .push_s3_template
+  variables:
+    S3_ENV : rec1
+    CONFIG_ENV: recette1
+
+# push binaries & config to S3 for the 'recette 2' environment.
+push_s3_rec2:
+  extends: .push_s3_template
+  variables:
+    S3_ENV : rec2
+    CONFIG_ENV: recette2
+
+# push binaries & config to S3 for the 'recette 3' environment.
+push_s3_rec3:
+  extends: .push_s3_template
+  variables:
+    S3_ENV : rec3
+    CONFIG_ENV: recette3
+
+
+push_s3_ppr:
+  extends: .push_s3_template
+  variables:
+    S3_ENV : ppr
+    CONFIG_ENV: preprod
+
+.dbdeploy:
+  image : registry.gitlab.com/veolia.com/sarp/sarp/sarpdevint/ci-cd-repository/sarp-dotnet/db-deploy:latest
+  variables:
+    SHELL: powershell
+  before_script:
+    - $ErrorActionPreference = "Stop"
+  script:
+    - aws --version
+    - Write-Host "AWS CLI version check complete."
+
+    - |
+      if ($env:DO_BUILD -eq "false") {
+        $PIPELINE_ID = $env:DEFAULT_PIPELINE_ID
+      } ElseIf ([string]::IsNullOrEmpty($env:CI_COMMIT_TAG)) {
+        $PIPELINE_ID = $env:CI_PIPELINE_IID
+      } Else {
+        $PIPELINE_ID = $env:CI_COMMIT_TAG
+      }
+
+    - $OBJECT_KEY_CONFIGS_SERVICE = "jason/$env:S3_ENV/$PIPELINE_ID/Services/Configs.zip"
+    - $OBJECT_KEY_DB = "jason/$env:S3_ENV/$PIPELINE_ID/Services/Db.zip"
+
+    - |
+      if (-not (Test-Path C:\Database)) {
+        New-Item -ItemType Directory -Path C:\Database -Force | Out-Null
+      }
+    - aws s3 cp "s3://$env:S3_BUCKET/$OBJECT_KEY_DB" C:\Database\Db.zip
+    - Expand-Archive -Path C:\Database\Db.zip -DestinationPath C:\Database -Force
+
+    - |
+      if (-not (Test-Path C:\Configs)) {
+        New-Item -ItemType Directory -Path C:\Configs -Force | Out-Null
+      }
+    - aws s3 cp "s3://$env:S3_BUCKET/$OBJECT_KEY_CONFIGS_SERVICE" C:\Configs\Configs.zip
+    - Expand-Archive -Path C:\Configs\Configs.zip -DestinationPath C:\Configs -Force
+    
+    - |
+      if (Test-Path C:\DbDeploy\DatabaseDeploy.exe.config) {
+        Remove-Item -Path C:\DbDeploy\DatabaseDeploy.exe.config -Force
+      }
+    - Copy-Item -Path $env:TEMPLATE_DBDEPLOY_FILE -Destination C:\DbDeploy\DatabaseDeploy.exe.config.secret -Force
+    - PowerShell -ExecutionPolicy Bypass -File C:\aws_secret_replacement.ps1
+    - C:\DbDeploy\DatabaseDeploy.exe
+    - cd C:\tmp
+    - dir
+  artifacts:
+      when: always
+      paths:
+        - C:\tmp\*
+  tags:
+    - prd-win-2022
+  only:
+    - tags
+
+deploy_rec1:
+  extends: .dbdeploy
+  stage: deploy-rec
+  environment:
+    name: jason_recette_1
+  variables:
+    TEMPLATE_DBDEPLOY_FILE: "C:\\Configs\\dbDeploy-rec1.config"
+    S3_ENV : rec1
+  dependencies:
+      - push_s3_rec1
+  when: manual
+
+deploy_rec2:
+  extends: .dbdeploy
+  stage: deploy-rec
+  environment:
+    name: jason_recette_2
+  variables:
+    TEMPLATE_DBDEPLOY_FILE: "C:\\Configs\\dbDeploy-rec2.config"
+    S3_ENV : rec2
+  dependencies:
+      - push_s3_rec2
+  when: manual
+
+deploy_rec3:
+  extends: .dbdeploy
+  stage: deploy-rec
+  environment:
+    name: jason_recette_3
+  variables:
+    TEMPLATE_DBDEPLOY_FILE: "C:\\Configs\\dbDeploy-rec3.config"
+    S3_ENV : rec3
+  dependencies:
+      - push_s3_rec3
+  when: manual
+
+# Publish job for EC2 Auto Scaling
+.deploy_ec2:
+  image: amazon/aws-cli
+  before_script:
+    - aws --version
+    - echo "AWS CLI version check complete."
+    - yum  install -y gettext jq
+    - gettext --version
+  script:
+    - |
+        escape_sed() {
+          echo "$1" | sed -e 's/[\/&]/\\&/g' -e  's/\\/\\\\/g'
+        }
+
+        if [ "$DO_BUILD" = "false" ]; then
+            CI_PIPELINE_IID=$DEFAULT_PIPELINE_ID
+        fi
+        
+        if [ ! -z "$CI_COMMIT_TAG" ]; then
+          PIPELINE_ID=$CI_COMMIT_TAG
+        else
+          PIPELINE_ID=$CI_PIPELINE_IID
+        fi
+
+        ESCAPED_S3_BUCKET=$(escape_sed "$S3_BUCKET")
+        ESCAPED_TEMPLATE_SETTING_FILE=$(escape_sed "$TEMPLATE_SETTING_FILE")
+        ESCAPED_SETTING_FILE=$(escape_sed "$SETTING_FILE")
+        ESCAPED_TEMPLATE_WEBCONF_FILE=$(escape_sed "$TEMPLATE_WEBCONF_FILE")
+        ESCAPED_WEBCONF_FILE=$(escape_sed "$WEBCONF_FILE")
+        ESCAPED_TEMPLATE_JASPER_FILE=$(escape_sed "$TEMPLATE_JASPER_FILE")
+        ESCAPED_JASPER_FILE=$(escape_sed "$JASPER_FILE")
+        ESCAPED_TEMPLATE_DBDEPLOY_FILE=$(escape_sed "$TEMPLATE_DBDEPLOY_FILE")
+        ESCAPED_DBDEPLOY_FILE=$(escape_sed "$DBDEPLOY_FILE")
+        ESCAPED_DEPLOY_SOURCE=$(escape_sed "$DEPLOY_SOURCE")
+        ESCAPED_SECRET_JOIN_AD=$(escape_sed "$SECRET_JOIN_AD")
+        ESCAPED_SECRET_UPDATE_USER=$(escape_sed "$SECRET_UPDATE_USER")
+        ESCAPED_SERVICE_USER=$(escape_sed "$SERVICE_USER")
+
+        ls -l $DEPLOY_SCRIPT_FILE
+
+        echo "==== Creation du userdata ===="
+        # PowerShell script to download ZIP files from S3
+        sed -e "s|__S3_BUCKET__|${ESCAPED_S3_BUCKET}|g" -e "s|__ZIP_FILES__|${ZIP_FILES}|g" -e "s|__CI_PIPELINE_IID__|${PIPELINE_ID}|g" -e "s|__TEMPLATE_SETTING_FILE__|${ESCAPED_TEMPLATE_SETTING_FILE}|g"  -e "s|__SETTING_FILE__|${ESCAPED_SETTING_FILE}|g"  -e "s|__TEMPLATE_WEBCONF_FILE__|${ESCAPED_TEMPLATE_WEBCONF_FILE}|g"   -e "s|__WEBCONF_FILE__|${ESCAPED_WEBCONF_FILE}|g"  -e "s|__TEMPLATE_JASPER_FILE__|${ESCAPED_TEMPLATE_JASPER_FILE}|g" -e "s|__JASPER_FILE__|${ESCAPED_JASPER_FILE}|g"  -e "s|__TEMPLATE_DBDEPLOY_FILE__|${ESCAPED_TEMPLATE_DBDEPLOY_FILE}|g"  -e "s|__DBDEPLOY_FILE__|${ESCAPED_DBDEPLOY_FILE}|g"  -e "s|__DEPLOY_SOURCE__|${ESCAPED_DEPLOY_SOURCE}|g" -e "s|__SECRET_JOIN_AD__|$SECRET_JOIN_AD|g" -e "s|__SECRET_UPDATE_USER__|$SECRET_UPDATE_USER|g" -e "s|__SERVICE_USER__|$ESCAPED_SERVICE_USER|g" -e "s|__DD_ENV__|$DD_ENV|g" -e "s|__CW_LOGS_GROUP__|$CWLOGSGROUP|g"  $DEPLOY_SCRIPT_FILE > script_userdata.ps1 
+        export ENCODED_NEW_USER_DATA=$(base64 -w 0 script_userdata.ps1)
+        #echo "New UserData (Base64 Encoded) $ENCODED_NEW_USER_DATA"
+
+        echo "==== Fin de creation du userdata ===="
+
+        echo "==== Creation du launch Template ===="
+  
+        cat $LAUNCH_TEMPLATE_DATA | envsubst > /tmp/launch-tmp.json
+
+        LT_DEFAULT_VERSION=$(aws ec2 describe-launch-template-versions --launch-template-id $LAUNCH_TEMPLATE_ID --query 'LaunchTemplateVersions[0].VersionNumber' --versions $Default --output text)
+        echo "Launch Template Default Version : $LT_DEFAULT_VERSION"
+
+        LT_NEW_VERSION=$(aws ec2 create-launch-template-version --launch-template-name $LAUNCH_TEMPLATE_NAME --source-version $LT_DEFAULT_VERSION  --launch-template-data "$(cat /tmp/launch-tmp.json)" --query 'LaunchTemplateVersion.VersionNumber' --output text)
+        echo "Launch Template Nouvelle Version : $LT_NEW_VERSION"
+
+        echo "==== Fin de  Creation du launch Template ===="
+
+        # Update the Auto Scaling group to use the new Launch Template version
+        echo "==== Mise a jour autoscaling ===="
+
+        aws autoscaling update-auto-scaling-group --auto-scaling-group-name $AUTO_SCALING_GROUP_NAME --launch-template LaunchTemplateName=$LAUNCH_TEMPLATE_NAME,Version=$LT_NEW_VERSION  --desired-capacity 1 --min-size 1 --max-size 1
+
+        echo "==== Fin Mise a jour autoscaling ===="
+
+        echo "==== Launch Template et Auto Scaling Group mis à jour avec success. ===="
+
+        echo "==== Debut du rafraichissement de l'instance ===="
+
+        aws autoscaling start-instance-refresh --auto-scaling-group-name $AUTO_SCALING_GROUP_NAME --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 400}'
+
+        echo "==== Fin  du rafraichissement de l'instance ===="
+
+        echo "==== Attendre que les anciennes instances passe en status terminating....... ===="
+        sleep 60
+
+        echo "==== Debut du processus de Deploiement. ===="
+
+        TIMEOUT=2400
+        INTERVAL=60
+        ELAPSED=0
+        # Attendre que toutes les instances soient InService ET running
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          INSTANCEIDS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name  "$AUTO_SCALING_GROUP_NAME" --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' --output text)
+          RUNNING_OK=1
+          for inst in $INSTANCEIDS; do
+            STATE=$(aws ec2 describe-instances --instance-ids $inst --query 'Reservations[0].Instances[0].State.Name' --output text)
+            if [ "$STATE" != "running" ]; then
+              RUNNING_OK=0
+            fi
+          done
+          if [ $RUNNING_OK -eq 1 ] && [ "$INSTANCEIDS" != "" ]; then
+            echo "Les instances en services et running sont : $INSTANCEIDS"
+            break
+          fi
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED+INTERVAL))
+          echo "En Attente  que toutes les instances soit InService/running ($ELAPSED s)"
+        done
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "Instances n'ont pas pu être être  InService/running apres $TIMEOUT secondes"
+          exit 1
+        fi
+        # Pour chaque instance, attendre le log stream puis lire les logs de façon incrémentale
+        PASSED_ALL=1
+        for inst in $INSTANCEIDS; do
+          LOGSTREAM="${inst}-${SERVER_TYPE}-${PIPELINE_ID}"
+          #LOGSTREAM="${inst}-${SERVER_TYPE}-100"
+          WAIT_STREAM=1800 # 30 minutes
+          ELAPSED_STREAM=0
+          while [ $ELAPSED_STREAM -lt $WAIT_STREAM ]; do
+            FOUND=$(aws logs describe-log-streams --log-group-name "$CWLOGSGROUP" --log-stream-name-prefix "$LOGSTREAM" --query 'logStreams[*].logStreamName' --output text)
+            if [ "x$FOUND" != "x" ]; then
+              break
+            fi
+            sleep 60
+            ELAPSED_STREAM=$((ELAPSED_STREAM + 60))
+            echo "Instance $inst: En attente du logstream $LOGSTREAM ($ELAPSED_STREAM s)"
+          done
+          if [ $ELAPSED_STREAM -ge $WAIT_STREAM ]; then
+            echo "Timeout pour le logstream $LOGSTREAM du serveur de  ${SERVER_TYPE} pour  instance $inst"
+            PASSED_ALL=0
+            continue
+          fi
+          echo "==== CLOUDWATCH LOGS for $inst ===="
+          END_FOUND=0
+          SEARCH_TIMEOUT=1800 # 30 min max d'attente pour la bonne ligne
+          SEARCH_INTERVAL=15
+          SEARCH_ELAPSED=0
+          NEXT_TOKEN=""
+          while [ $SEARCH_ELAPSED -lt $SEARCH_TIMEOUT ]; do
+            if [ -z "$NEXT_TOKEN" ]; then
+              RESPONSE=$(aws logs get-log-events --log-group-name "$CWLOGSGROUP" --log-stream-name "$LOGSTREAM" --output json)
+            else
+              RESPONSE=$(aws logs get-log-events --log-group-name "$CWLOGSGROUP" --log-stream-name "$LOGSTREAM" --next-token "$NEXT_TOKEN" --output json)
+            fi
+            # Afficher les nouveaux événements uniquement
+            #echo "$RESPONSE" | jq -r '.events[].message'
+            echo "$RESPONSE" | jq -r '.events[].message' | while IFS= read -r line; do
+                echo -e "\e[33m$line\e[0m"   # Jaune
+            done
+            # Vérifie la présence de 'Fin du userdata'
+            if echo "$RESPONSE" | jq -r '.events[].message' | grep -q "Fin du userdata"; then
+              echo "SUCCESS: 'Ton Deploiement du  ${SERVER_TYPE} est terminé dans la machine $inst , verifié les logs pour plus dinformations'."
+              END_FOUND=1
+              break
+            fi
+            # Met à jour le nextForwardToken
+            NEXT_TOKEN=$(echo "$RESPONSE" | jq -r '.nextForwardToken')
+            sleep $SEARCH_INTERVAL
+            SEARCH_ELAPSED=$((SEARCH_ELAPSED + $SEARCH_INTERVAL))
+            #echo "Waiting for 'Fin du userdata' in logs for $inst... ($SEARCH_ELAPSED s)"
+          done
+          if [ $END_FOUND -eq 0 ]; then
+            echo "ECHEC: problème avec logs pour linstance $inst."
+            PASSED_ALL=0
+          fi
+          echo "==== END CLOUDWATCH LOGS for $inst ===="
+        done
+
+        if [ $PASSED_ALL -eq 1 ]; then
+          echo "Toutes les instances on executées le user data."
+          exit 0
+        else
+          echo "ECHEC: Des instances ont échouées lors de l'execution du userdata."
+          exit 1
+        fi
+
+        echo "==== Fin du processus de Deploiement,  attendre le healthcheck. ===="
+  variables:
+    SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings.json"
+    WEBCONF_FILE: "$DEPLOY_SOURCE\\Configs\\Web.config"
+    JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports.config"
+    DBDEPLOY_FILE: "$DEPLOY_SOURCE\\Configs\\dbdeploy.config"
+  tags:
+    - prd
+  only:
+    - tags
+
+deploy_ec2_rec1_web:
+  extends: .deploy_ec2
+  environment:
+    name: jason_recette_1
+    url: https://jason-rec1.sarpnet.fr
+  stage: deploy-ec2-rec
+  variables:
+    SERVER_TYPE: "web"
+    CWLOGSGROUP: "/rec1/jason/autoscalling/iis"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials" 
+    SECRET_UPDATE_USER: "rec/autoscaling/ADServiceJason/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "asg-recette1-jason-iis"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-IIS-REC1"
+    LAUNCH_TEMPLATE_ID: "lt-043a24e0bd740a72a"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/recette1/launch-template-data-web-rec1.json"
+    ZIP_FILES: "jason/rec1"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/recette1/userdata_deploy_template_web-rec1.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-rec1.json"
+    TEMPLATE_WEBCONF_FILE: "$DEPLOY_SOURCE\\Configs\\Web-rec1.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports-rec1.config"
+    DD_ENV: "recette1"
+  needs:
+    - job: push_s3_rec1
+      optional: false
+    - job: deploy_rec1
+      optional: false
+  dependencies:
+      - push_s3_rec1
+
+deploy_ec2_rec1_service:
+  extends: .deploy_ec2
+  environment:
+    name: jason_recette_1
+    url: https://jason-rec1-service.sarpnet.fr/servicesAutoScalingHealth
+  stage: deploy-ec2-rec
+  variables:
+    SERVER_TYPE: "service"
+    CWLOGSGROUP: "/rec1/jason/autoscalling/iis"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials"
+    DEPLOY_SOURCE: "D:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "asg-recette1-jason-svc"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-APP-REC1"
+    LAUNCH_TEMPLATE_ID: "lt-038fdeed593155881"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/recette1/launch-template-data-service-rec1.json"
+    ZIP_FILES: "jason/rec1"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/recette1/userdata_deploy_template_services-rec1.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-rec1.json"
+    TEMPLATE_DBDEPLOY_FILE: "$DEPLOY_SOURCE\\Configs\\dbDeploy-rec1.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports-rec1.config"
+    DD_ENV: "recette1"
+  needs:
+    - job: push_s3_rec1
+      optional: false
+    - job: deploy_rec1
+      optional: false
+  dependencies:
+      - push_s3_rec1
+
+deploy_ec2_rec2_web:
+  extends: .deploy_ec2
+  environment:
+    name: jason_recette_2
+    url: https://jason-rec2.sarpnet.fr
+  stage: deploy-ec2-rec
+  variables:
+    SERVER_TYPE: "web"
+    CWLOGSGROUP: "/rec2/jason/autoscalling/iis"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials" 
+    SECRET_UPDATE_USER: "rec/autoscaling/ADServiceJason/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "demo-recette2-jason-iis"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-IIS-REC2"
+    LAUNCH_TEMPLATE_ID: "lt-0ba8170c76af4a271"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/recette2/launch-template-data-web-rec2.json"
+    ZIP_FILES: "jason/rec2"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/recette2/userdata_deploy_template_web-rec2.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-rec2.json"
+    TEMPLATE_WEBCONF_FILE: "$DEPLOY_SOURCE\\Configs\\Web-rec2.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports-rec2.config"
+    DD_ENV: "recette2"
+  needs:
+    - job: push_s3_rec2
+      optional: false
+    - job: deploy_rec2
+      optional: false
+  dependencies:
+    - push_s3_rec2
+
+deploy_ec2_rec2_service:
+  extends: .deploy_ec2
+  environment:
+    name: jason_recette_2
+    url: https://jason-rec2-service.sarpnet.fr/servicesAutoScalingHealth
+  stage: deploy-ec2-rec
+  variables:
+    SERVER_TYPE: "service"
+    CWLOGSGROUP: "/rec2/jason/autoscalling/iis"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "demo-recette2-jason-app"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-APP-REC2"
+    LAUNCH_TEMPLATE_ID: "lt-0112a2d12afc81395"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/recette2/launch-template-data-service-rec2.json"
+    ZIP_FILES: "jason/rec2"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/recette2/userdata_deploy_template_services-rec2.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-rec2.json"
+    TEMPLATE_DBDEPLOY_FILE: "$DEPLOY_SOURCE\\Configs\\dbDeploy-rec2.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports-rec2.config"
+    DD_ENV: "recette2"
+  needs:
+    - job: push_s3_rec2
+      optional: false
+    - job: deploy_rec2
+      optional: false
+  dependencies:
+    - push_s3_rec2
+
+deploy_ec2_rec3_web:
+  extends: .deploy_ec2
+  environment:
+    name: jason_recette_3
+    url: https://jason-rec3.sarpnet.fr
+  stage: deploy-ec2-rec
+  variables:
+    SERVER_TYPE: "web"
+    CWLOGSGROUP: "/rec3/jason/autoscalling/iis"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials" 
+    SECRET_UPDATE_USER: "rec/autoscaling/ADServiceJason/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "demo-recette3-jason-iis"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-IIS-REC3"
+    LAUNCH_TEMPLATE_ID: "lt-085b46bbefa8c09cf" 
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/recette3/launch-template-data-web-rec3.json"
+    ZIP_FILES: "jason/rec3"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/recette3/userdata_deploy_template_web-rec3.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-rec3.json"
+    TEMPLATE_WEBCONF_FILE: "$DEPLOY_SOURCE\\Configs\\Web-rec3.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports-rec3.config"
+    DD_ENV: "recette3"
+  needs:
+    - job: push_s3_rec3
+      optional: false
+    - job: deploy_rec3
+      optional: false
+  dependencies:
+      - push_s3_rec3
+
+deploy_ec2_rec3_service:
+  extends: .deploy_ec2
+  stage: deploy-ec2-rec
+  environment:
+    name: jason_recette_3
+    url: https://jason-rec3-service.sarpnet.fr/servicesAutoScalingHealth
+  variables:
+    SERVER_TYPE: "service"
+    CWLOGSGROUP: "/rec3/jason/autoscalling/iis"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials"
+    DEPLOY_SOURCE: "D:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "demo-recette3-jason-app"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-APP-REC3"
+    LAUNCH_TEMPLATE_ID: "lt-06479cbb925ce3bd3"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/recette3/launch-template-data-service-rec3.json"
+    ZIP_FILES: "jason/rec3"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/recette3/userdata_deploy_template_services-rec3.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-rec3.json"
+    TEMPLATE_DBDEPLOY_FILE: "$DEPLOY_SOURCE\\Configs\\dbDeploy-rec3.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\JasperReports-rec3.config"
+    DD_ENV: "recette3"
+  needs:
+    - job: push_s3_rec3
+      optional: false
+    - job: deploy_rec3
+      optional: false
+  dependencies:
+      - push_s3_rec3
+
+deploy_ppr:
+  extends: .dbdeploy
+  stage: deploy-ppr
+  environment:
+    name: jason_preprod
+  variables:
+    TEMPLATE_DBDEPLOY_FILE: "C:\\Configs\\dbDeploy-rec2.config"
+    S3_ENV : rec2
+  dependencies:
+      - push_s3_ppr
+  when: manual
+
+deploy_ec2_ppr_web:
+  extends: .deploy_ec2
+  environment:
+    name: jason_preprod
+    url: https://jason-ppr.sarpnet.fr
+  stage: deploy-ec2-ppr
+  variables:
+    SERVER_TYPE: "web"
+    CWLOGSGROUP: "/pprd/jason/autoscalling"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials" 
+    SECRET_UPDATE_USER: "rec/autoscaling/ADServiceJason/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "asg-preprod1-jason-iis"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-IIS-PREPROD1"
+    LAUNCH_TEMPLATE_ID: "lt-0c01816749d725c11" 
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/preprod/launch-template-data-web-pprd.json"
+    ZIP_FILES: "jason/ppr"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/preprod/userdata_deploy_template_web-pprd.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-pprd.json"
+    TEMPLATE_WEBCONF_FILE: "$DEPLOY_SOURCE\\Configs\\Web-pprd.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\jasperReports-pprd.config"
+    DD_ENV: "preprod1"
+  needs:
+    - job: push_s3_ppr
+      optional: false
+    - job: deploy_ppr
+      optional: false
+  dependencies:
+      - push_s3_ppr
+
+deploy_ec2_ppr_service1:
+  extends: .deploy_ec2
+  environment:
+    name: jason_preprod
+    url: https://jason-preprod1-service.sarpnet.fr/servicesAutoScalingHealth
+  stage: deploy-ec2-ppr
+  variables:
+    SERVER_TYPE: "service1"
+    CWLOGSGROUP: "/pprd/jason/autoscalling"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "asg-preprod1-jason-srvc1"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-SRVC1-PREPROD1"
+    LAUNCH_TEMPLATE_ID: "lt-043c4ca3e58016f8d"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/preprod/launch-template-data-service1-pprd.json"
+    ZIP_FILES: "jason/ppr"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/preprod/userdata_deploy_template_services1-pprd.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-pprd.json"
+    TEMPLATE_DBDEPLOY_FILE: "$DEPLOY_SOURCE\\Configs\\dbDeploy-pprd.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\jasperReports-pprd.config"
+    DD_ENV: "preprod1"
+  needs:
+    - job: push_s3_ppr
+      optional: false
+    - job: deploy_ppr
+      optional: false
+  dependencies:
+      - push_s3_ppr
+
+deploy_ec2_ppr_service2:
+  extends: .deploy_ec2
+  environment:
+    name: jason_preprod
+    url: https://jason-preprod1-service.sarpnet.fr/servicesAutoScalingHealth
+  stage: deploy-ec2-ppr
+  variables:
+    SERVER_TYPE: "service2"
+    CWLOGSGROUP: "/pprd/jason/autoscalling"
+    SECRET_JOIN_AD: "rec/autoscaling/AD/credentials"
+    DEPLOY_SOURCE: "E:\\Tmp\\userdata_storage"
+    AUTO_SCALING_GROUP_NAME: "asg-preprod1-jason-srvc2"
+    LAUNCH_TEMPLATE_NAME: "MOD-JASON-SRVC2-PREPROD1"
+    LAUNCH_TEMPLATE_ID: "lt-05568e2937dd41ab1"
+    LAUNCH_TEMPLATE_DATA: "CICD/launchTemplateDatas/preprod/launch-template-data-service2-pprd.json"
+    ZIP_FILES: "jason/ppr"
+    DEPLOY_SCRIPT_FILE: "CICD/userdataTemplates/preprod/userdata_deploy_template_services2-pprd.ps1"
+    TEMPLATE_SETTING_FILE: "$DEPLOY_SOURCE\\Configs\\settings-pprd.json"
+    TEMPLATE_DBDEPLOY_FILE: "$DEPLOY_SOURCE\\Configs\\dbDeploy-pprd.config"
+    TEMPLATE_JASPER_FILE: "$DEPLOY_SOURCE\\Configs\\jasperReports-pprd.config"
+    DD_ENV: "preprod1"
+  needs:
+    - job: push_s3_ppr
+      optional: false
+    - job: deploy_ppr
+      optional: false
+  dependencies:
+      - push_s3_ppr
+  
